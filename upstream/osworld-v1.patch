@@ -1,0 +1,159 @@
+diff --git a/desktop_env/controllers/setup.py b/desktop_env/controllers/setup.py
+index 43cbeb7..581bd62 100644
+--- a/desktop_env/controllers/setup.py
++++ b/desktop_env/controllers/setup.py
+@@ -110,19 +110,23 @@ def _wait_for_chrome_ws_ready(http_server: str, remote_debugging_url: str) -> No
+     deadline = time.time() + CHROME_CDP_READY_TIMEOUT_S
+     last_state = "not probed yet"
+     while time.time() < deadline:
+-        file_guid = _read_chrome_stderr_ws_guid(http_server)
+-        if file_guid is None:
+-            last_state = "'DevTools listening' marker not in chrome stderr log yet"
+-        else:
+-            try:
+-                data = requests.get(f"{remote_debugging_url}/json/version", timeout=5).json()
+-                ws_url = data.get("webSocketDebuggerUrl") or ""
+-                live_guid = ws_url.rsplit("/", 1)[-1] if "/devtools/browser/" in ws_url else ""
+-                if live_guid and live_guid == file_guid:
++        # /json/version is the authoritative readiness signal.  Some Chrome
++        # builds (and the VM's bash launcher) do not reliably preserve the
++        # stderr "DevTools listening" line, so requiring that line caused
++        # healthy CDP endpoints to be rejected as not ready.
++        try:
++            data = requests.get(f"{remote_debugging_url}/json/version", timeout=5).json()
++            ws_url = data.get("webSocketDebuggerUrl") or ""
++            if "/devtools/browser/" in ws_url:
++                # A short TCP probe prevents handing Playwright an endpoint
++                # that answered HTTP while the websocket listener is still
++                # being brought up.
++                probe = requests.get(f"{remote_debugging_url}/json/list", timeout=5)
++                if probe.ok:
+                     return
+-                last_state = "browser GUID mismatch (stale stderr log)"
+-            except Exception as e:
+-                last_state = f"debug endpoint not answering: {e}"
++            last_state = "CDP version endpoint has no usable websocket URL yet"
++        except Exception as e:
++            last_state = f"debug endpoint not answering: {e}"
+         time.sleep(1)
+     raise ChromeNotReadyError(
+         f"Chrome DevTools websocket server not ready at {remote_debugging_url} "
+@@ -132,7 +136,28 @@ def _wait_for_chrome_ws_ready(http_server: str, remote_debugging_url: str) -> No
+ 
+ def _connect_chrome_over_cdp(playwright, remote_debugging_url: str, http_server: str):
+     _wait_for_chrome_ws_ready(http_server, remote_debugging_url)
+-    return playwright.chromium.connect_over_cdp(remote_debugging_url)
++    # Playwright's Node HTTP discovery uses the host proxy environment and
++    # does not reliably honor CIDR NO_PROXY entries. Resolve locally, then
++    # attach directly to the websocket; keep model API proxy settings intact.
++    with requests.Session() as session:
++        session.trust_env = False
++        response = session.get(f"{remote_debugging_url}/json/version", timeout=10)
++        response.raise_for_status()
++        websocket_url = response.json().get("webSocketDebuggerUrl")
++    if not websocket_url or not websocket_url.startswith(("ws://", "wss://")):
++        raise ChromeNotReadyError("Chrome returned no valid DevTools websocket URL")
++    last_error = None
++    # The HTTP endpoint can become ready a fraction of a second before the
++    # browser websocket accepts its first attach.  Retry the attach locally
++    # instead of forcing the caller through a full environment reset.
++    for attempt in range(3):
++        try:
++            return playwright.chromium.connect_over_cdp(websocket_url, timeout=15000)
++        except Exception as exc:
++            last_error = exc
++            if attempt < 2:
++                time.sleep(1)
++    raise last_error
+ 
+ 
+ class SetupController:
+@@ -1127,22 +1152,23 @@ class SetupController:
+             else:
+                 raise Exception('Unsupported operating system')
+ 
+-            form = MultipartEncoder({
+-                "file_path": chrome_history_path,
+-                "file_data": (os.path.basename(chrome_history_path), open(db_path, "rb"))
+-            })
+-            headers = {"Content-Type": form.content_type}
+-            logger.debug(form.content_type)
++            # Release the multipart file before TemporaryDirectory removes it.
++            # Windows refuses to delete an open SQLite upload file.
++            with open(db_path, "rb") as history_file:
++                form = MultipartEncoder({
++                    "file_path": chrome_history_path,
++                    "file_data": (os.path.basename(chrome_history_path), history_file)
++                })
++                headers = {"Content-Type": form.content_type}
++                logger.debug(form.content_type)
+ 
+-            # send request to server to upload file
+-            try:
+-                logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/upload")
+-                response = requests.post(self.http_server + "/setup" + "/upload", headers=headers, data=form)
+-                if response.status_code == 200:
++                try:
++                    logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/upload")
++                    response = requests.post(self.http_server + "/setup" + "/upload", headers=headers, data=form, timeout=60)
++                    response.raise_for_status()
+                     logger.info("Command executed successfully: %s", response.text)
+-                else:
+-                    logger.error("Failed to upload file. Status code: %s", response.text)
+-            except requests.exceptions.RequestException as e:
+-                logger.error("An error occurred while trying to send the request: %s", e)
++                except requests.exceptions.RequestException as e:
++                    logger.error("History upload failed: %s", type(e).__name__)
++                    raise
+ 
+             self._execute_setup(["sudo chown -R user:user /home/user/.config/google-chrome/Default/History"], shell=True)
+diff --git a/lib_results_logger.py b/lib_results_logger.py
+index a33df50..cf5498d 100644
+--- a/lib_results_logger.py
++++ b/lib_results_logger.py
+@@ -7,7 +7,11 @@ Appends task completion results to results.json in real-time.
+ import json
+ import os
+ import time
+-import fcntl
++try:
++    import fcntl
++except ModuleNotFoundError:  # Windows does not provide fcntl
++    fcntl = None
++    import msvcrt
+ from pathlib import Path
+ from typing import Dict, Any, Optional
+ 
+@@ -67,7 +71,11 @@ def append_task_result(
+     try:
+         with open(results_file, 'a+') as f:
+             # Lock the file for exclusive access
+-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
++            if fcntl is not None:
++                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
++            else:
++                f.seek(0)
++                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+             
+             try:
+                 # Move to beginning to read existing content
+@@ -96,7 +104,11 @@ def append_task_result(
+                 
+             finally:
+                 # Always unlock the file
+-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
++                if fcntl is not None:
++                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
++                else:
++                    f.seek(0)
++                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                 
+         print(f"📝 Logged result: {domain}/{task_id} -> {result_entry['status']} (score: {score})")
+         
+@@ -132,4 +144,4 @@ def log_task_error(example: Dict, error_msg: str, result_dir: str, args: Any) ->
+     """
+     task_id = example.get('id', 'unknown')
+     domain = extract_domain_from_path(result_dir) 
+-    append_task_result(task_id, domain, 0.0, result_dir, args, error_msg)
+\ No newline at end of file
++    append_task_result(task_id, domain, 0.0, result_dir, args, error_msg)
